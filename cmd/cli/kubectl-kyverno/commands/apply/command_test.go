@@ -83,6 +83,58 @@ func Test_Apply(t *testing.T) {
 	testcases := []*TestCase{
 		{
 			config: ApplyCommandConfig{
+				PolicyPaths:              []string{"../../../../../test/cli/apply/exception-within-policy/pol"},
+				ResourcePaths:            []string{"../../../../../test/cli/apply/exception-within-policy/res"},
+				exceptionsWithinPolicies: true,
+				PolicyReport:             true,
+			},
+			expectedReports: []openreportsv1alpha1.Report{{
+				Summary: openreportsv1alpha1.ReportSummary{
+					Pass:  2,
+					Fail:  0,
+					Skip:  1,
+					Error: 0,
+					Warn:  0,
+				},
+			}},
+		},
+		{
+			config: ApplyCommandConfig{
+				PolicyPaths:               []string{"../../../../../test/cli/apply/exception-within-resource/pol"},
+				ResourcePaths:             []string{"../../../../../test/cli/apply/exception-within-resource/res"},
+				exceptionsWithinResources: true,
+				PolicyReport:              true,
+			},
+			expectedReports: []openreportsv1alpha1.Report{{
+				Summary: openreportsv1alpha1.ReportSummary{
+					Pass:  2,
+					Fail:  0,
+					Skip:  1,
+					Error: 0,
+					Warn:  0,
+				},
+			}},
+		},
+		{
+			config: ApplyCommandConfig{
+				PolicyPaths:               []string{"../../../../../test/cli/apply/exception-within-policy-and-resource/pol"},
+				ResourcePaths:             []string{"../../../../../test/cli/apply/exception-within-policy-and-resource/res"},
+				exceptionsWithinResources: true,
+				exceptionsWithinPolicies:  true,
+				PolicyReport:              true,
+			},
+			expectedReports: []openreportsv1alpha1.Report{{
+				Summary: openreportsv1alpha1.ReportSummary{
+					Pass:  1,
+					Fail:  0,
+					Skip:  2,
+					Error: 0,
+					Warn:  0,
+				},
+			}},
+		},
+		{
+			config: ApplyCommandConfig{
 				PolicyPaths:   []string{"../../../../../test/best_practices/disallow_latest_tag.yaml"},
 				ResourcePaths: []string{"../../../../../test/resources/pod_with_version_tag.yaml"},
 				PolicyReport:  true,
@@ -476,7 +528,6 @@ func Test_Apply(t *testing.T) {
 		assert.Equal(t, actual.Warn, expected.Warn, desc)
 		assert.Equal(t, actual.Error, expected.Error, desc)
 		assert.Equal(t, actual.Pass, expected.Pass, desc)
-
 	}
 
 	verifyTestcase := func(t *testing.T, tc *TestCase, compareSummary func(openreportsv1alpha1.ReportSummary, openreportsv1alpha1.ReportSummary, string)) {
@@ -803,6 +854,23 @@ func Test_Apply_ValidatingPolicies(t *testing.T) {
 				},
 			}},
 		},
+		// JSON-mode policy applied to a K8s resource should evaluate via JSON path
+		{
+			config: ApplyCommandConfig{
+				PolicyPaths:   []string{"../../../../../test/cli/test-validating-policy/json-mode-on-resource/policy.yaml"},
+				ResourcePaths: []string{"../../../../../test/cli/test-validating-policy/check-deployment-labels/deployment1.yaml"},
+				PolicyReport:  true,
+			},
+			expectedReports: []openreportsv1alpha1.Report{{
+				Summary: openreportsv1alpha1.ReportSummary{
+					Pass:  0,
+					Fail:  1,
+					Skip:  0,
+					Error: 0,
+					Warn:  0,
+				},
+			}},
+		},
 	}
 
 	for _, tc := range testcases {
@@ -812,13 +880,30 @@ func Test_Apply_ValidatingPolicies(t *testing.T) {
 	}
 }
 
+// Test_Apply_JsonPayload_K8sMode_NoSegfault verifies that applying a
+// Kubernetes-mode policy against a JSON payload does not panic (segfault).
+// The K8s-mode policy should be gracefully skipped with zero results.
+func Test_Apply_JsonPayload_K8sMode_NoSegfault(t *testing.T) {
+	config := ApplyCommandConfig{
+		PolicyPaths:  []string{"../../../../../test/cli/test-validating-policy/json-payload-k8s-mode-policy/policy.yaml"},
+		JSONPaths:    []string{"../../../../../test/cli/test-validating-policy/json-payload-k8s-mode-policy/payload.json"},
+		PolicyReport: true,
+	}
+	_, _, _, responses, err := config.applyCommandHelper(io.Discard)
+	assert.NoError(t, err, "should not crash with segfault")
+	// K8s-mode policy should be skipped for JSON payloads, so no responses expected
+	assert.Equal(t, 0, len(responses), "K8s-mode policies should be skipped for JSON payloads")
+}
+
 func Test_Apply_ImageVerificationPolicies(t *testing.T) {
 	testcases := []*TestCase{
 		{
 			config: ApplyCommandConfig{
 				PolicyPaths: []string{"../../../../../test/conformance/chainsaw/image-validating-policies/match-conditions/policy.yaml"},
-				ResourcePaths: []string{"../../../../../test/conformance/chainsaw/image-validating-policies/match-conditions/good-pod.yaml",
-					"../../../../../test/conformance/chainsaw/image-validating-policies/match-conditions/bad-pod.yaml"},
+				ResourcePaths: []string{
+					"../../../../../test/conformance/chainsaw/image-validating-policies/match-conditions/good-pod.yaml",
+					"../../../../../test/conformance/chainsaw/image-validating-policies/match-conditions/bad-pod.yaml",
+				},
 				PolicyReport: true,
 			},
 			expectedReports: []openreportsv1alpha1.Report{{
@@ -834,8 +919,10 @@ func Test_Apply_ImageVerificationPolicies(t *testing.T) {
 		{
 			config: ApplyCommandConfig{
 				PolicyPaths: []string{"../../../../../test/cli/test-image-validating-policy/check-json/ivpol-json.yaml"},
-				JSONPaths: []string{"../../../../../test/cli/test-image-validating-policy/check-json/ivpol-payload-pass.json",
-					"../../../../../test/cli/test-image-validating-policy/check-json/ivpol-payload-fail.json"},
+				JSONPaths: []string{
+					"../../../../../test/cli/test-image-validating-policy/check-json/ivpol-payload-pass.json",
+					"../../../../../test/cli/test-image-validating-policy/check-json/ivpol-payload-fail.json",
+				},
 				PolicyReport: true,
 			},
 			expectedReports: []openreportsv1alpha1.Report{{
@@ -1226,7 +1313,7 @@ func TestCommandWithJsonAndResource(t *testing.T) {
 }
 
 func TestCommandWarnExitCode(t *testing.T) {
-	var warnExitCode = 3
+	warnExitCode := 3
 
 	cmd := Command()
 	cmd.SetArgs([]string{
@@ -1313,4 +1400,54 @@ func Test_ImageValidatingPolicy_DefaultMessage(t *testing.T) {
 		}
 	}
 	assert.True(t, found, "Should have at least one failed rule")
+}
+
+func Test_Apply_ValidatingPoliciesWithCRD(t *testing.T) {
+	testcases := []*TestCase{
+		{
+			config: ApplyCommandConfig{
+				PolicyPaths:   []string{"../../_testdata/apply/test-3/resource-validating-policy/policy.yml"},
+				ResourcePaths: []string{"../../_testdata/apply/test-3/resources/resource.yml"},
+				CrdPath:       "../../_testdata/apply/test-3/crd/crd.yml",
+				PolicyReport:  true,
+			},
+			expectedReports: []openreportsv1alpha1.Report{{
+				Summary: openreportsv1alpha1.ReportSummary{
+					Pass:  1,
+					Fail:  0,
+					Skip:  0,
+					Error: 0,
+					Warn:  0,
+				},
+			}},
+		},
+	}
+
+	for _, tc := range testcases {
+		t.Run("", func(t *testing.T) {
+			verifyTestcase(t, tc, compareSummary)
+		})
+	}
+}
+
+func TestCommandCRDKubeEnable(t *testing.T) {
+	cmd := Command()
+	assert.NotNil(t, cmd)
+	b := bytes.NewBufferString("")
+	cmd.SetErr(b)
+	cmd.SetArgs([]string{
+		"../../_testdata/apply/test-2/policy.yaml",
+		"--resource",
+		"../../_testdata/apply/test-2/resources.yaml",
+		"--crd-path",
+		"./crd.yml",
+		"--kubeconfig",
+		"./kubeconfig.yaml",
+	})
+	err := cmd.Execute()
+	assert.Error(t, err)
+	out, err := io.ReadAll(b)
+	assert.NoError(t, err)
+	expected := `Error: crdpath and kubeconfig flags are mutually exclusive, please use only one of them`
+	assert.Equal(t, strings.TrimSpace(expected), strings.TrimSpace(string(out)))
 }

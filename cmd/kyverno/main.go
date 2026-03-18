@@ -16,6 +16,7 @@ import (
 	"github.com/kyverno/kyverno/pkg/admissionpolicy"
 	"github.com/kyverno/kyverno/pkg/auth/checker"
 	"github.com/kyverno/kyverno/pkg/breaker"
+	celengine "github.com/kyverno/kyverno/pkg/cel/engine"
 	"github.com/kyverno/kyverno/pkg/cel/libs"
 	"github.com/kyverno/kyverno/pkg/cel/matching"
 	ivpolengine "github.com/kyverno/kyverno/pkg/cel/policies/ivpol/engine"
@@ -80,13 +81,9 @@ import (
 )
 
 const (
-	exceptionWebhookControllerName      = "exception-webhook-controller"
-	celExceptionWebhookControllerName   = "celexception-webhook-controller"
-	gctxWebhookControllerName           = "global-context-webhook-controller"
-	webhookControllerFinalizerName      = "kyverno.io/webhooks"
-	exceptionControllerFinalizerName    = "kyverno.io/exceptionwebhooks"
-	celExceptionControllerFinalizerName = "kyverno.io/celexceptionwebhooks"
-	gctxControllerFinalizerName         = "kyverno.io/globalcontextwebhooks"
+	exceptionWebhookControllerName    = "exception-webhook-controller"
+	celExceptionWebhookControllerName = "celexception-webhook-controller"
+	gctxWebhookControllerName         = "global-context-webhook-controller"
 )
 
 var (
@@ -134,7 +131,6 @@ func createrLeaderControllers(
 	reportsServiceAccountName string,
 	webhookTimeout int,
 	autoUpdateWebhooks bool,
-	autoDeleteWebhooks bool,
 	kubeInformer kubeinformers.SharedInformerFactory,
 	kubeKyvernoInformer kubeinformers.SharedInformerFactory,
 	kyvernoInformer kyvernoinformer.SharedInformerFactory,
@@ -186,13 +182,10 @@ func createrLeaderControllers(
 		int32(webhookTimeout), //nolint:gosec
 		servicePort,
 		autoUpdateWebhooks,
-		autoDeleteWebhooks,
 		admissionReports,
 		runtime,
 		configuration,
 		caSecretName,
-		webhookcontroller.WebhookCleanupSetup(kubeClient, webhookControllerFinalizerName),
-		webhookcontroller.WebhookCleanupHandler(kubeClient, webhookControllerFinalizerName),
 		stateRecorder,
 	)
 	exceptionWebhookController := genericwebhookcontroller.NewController(
@@ -200,7 +193,6 @@ func createrLeaderControllers(
 		kubeClient.AdmissionregistrationV1().ValidatingWebhookConfigurations(),
 		kubeInformer.Admissionregistration().V1().ValidatingWebhookConfigurations(),
 		caInformer,
-		deploymentInformer,
 		config.ExceptionValidatingWebhookConfigurationName,
 		config.ExceptionValidatingWebhookServicePath,
 		serverIP,
@@ -221,17 +213,12 @@ func createrLeaderControllers(
 		genericwebhookcontroller.None,
 		configuration,
 		caSecretName,
-		runtime,
-		autoDeleteWebhooks,
-		webhookcontroller.WebhookCleanupSetup(kubeClient, exceptionControllerFinalizerName),
-		webhookcontroller.WebhookCleanupHandler(kubeClient, exceptionControllerFinalizerName),
 	)
 	celExceptionWebhookController := genericwebhookcontroller.NewController(
 		celExceptionWebhookControllerName,
 		kubeClient.AdmissionregistrationV1().ValidatingWebhookConfigurations(),
 		kubeInformer.Admissionregistration().V1().ValidatingWebhookConfigurations(),
 		caInformer,
-		deploymentInformer,
 		config.CELExceptionValidatingWebhookConfigurationName,
 		config.CELExceptionValidatingWebhookServicePath,
 		serverIP,
@@ -252,17 +239,12 @@ func createrLeaderControllers(
 		genericwebhookcontroller.None,
 		configuration,
 		caSecretName,
-		runtime,
-		autoDeleteWebhooks,
-		webhookcontroller.WebhookCleanupSetup(kubeClient, celExceptionControllerFinalizerName),
-		webhookcontroller.WebhookCleanupHandler(kubeClient, celExceptionControllerFinalizerName),
 	)
 	gctxWebhookController := genericwebhookcontroller.NewController(
 		gctxWebhookControllerName,
 		kubeClient.AdmissionregistrationV1().ValidatingWebhookConfigurations(),
 		kubeInformer.Admissionregistration().V1().ValidatingWebhookConfigurations(),
 		caInformer,
-		deploymentInformer,
 		config.GlobalContextValidatingWebhookConfigurationName,
 		config.GlobalContextValidatingWebhookServicePath,
 		serverIP,
@@ -283,10 +265,6 @@ func createrLeaderControllers(
 		genericwebhookcontroller.None,
 		configuration,
 		caSecretName,
-		runtime,
-		autoDeleteWebhooks,
-		webhookcontroller.WebhookCleanupSetup(kubeClient, gctxControllerFinalizerName),
-		webhookcontroller.WebhookCleanupHandler(kubeClient, gctxControllerFinalizerName),
 	)
 	policyStatusController := policystatuscontroller.NewController(
 		dynamicClient,
@@ -359,7 +337,6 @@ func main() {
 		maxQueuedEvents                 int
 		omitEvents                      string
 		autoUpdateWebhooks              bool
-		autoDeleteWebhooks              bool
 		webhookRegistrationTimeout      time.Duration
 		admissionReports                bool
 		dumpPayload                     bool
@@ -369,6 +346,7 @@ func main() {
 		backgroundServiceAccountName    string
 		reportsServiceAccountName       string
 		maxAPICallResponseLength        int64
+		apiCallTimeout                  time.Duration
 		renewBefore                     time.Duration
 		maxAuditWorkers                 int
 		maxAuditCapacity                int
@@ -383,7 +361,6 @@ func main() {
 	flagset.StringVar(&omitEvents, "omitEvents", "", "Set this flag to a comma sperated list of PolicyViolation, PolicyApplied, PolicyError, PolicySkipped to disable events, e.g. --omitEvents=PolicyApplied,PolicyViolation")
 	flagset.StringVar(&serverIP, "serverIP", "", "IP address where Kyverno controller runs. Only required if out-of-cluster.")
 	flagset.BoolVar(&autoUpdateWebhooks, "autoUpdateWebhooks", true, "Set this flag to 'false' to disable auto-configuration of the webhook.")
-	flagset.BoolVar(&autoDeleteWebhooks, "autoDeleteWebhooks", false, "Set this flag to 'true' to enable autodeletion of webhook configurations using finalizers (requires extra permissions).")
 	flagset.DurationVar(&webhookRegistrationTimeout, "webhookRegistrationTimeout", 120*time.Second, "Timeout for webhook registration, e.g., 30s, 1m, 5m.")
 	flagset.Func(toggle.ProtectManagedResourcesFlagName, toggle.ProtectManagedResourcesDescription, toggle.ProtectManagedResources.Parse)
 	flagset.Func(toggle.ForceFailurePolicyIgnoreFlagName, toggle.ForceFailurePolicyIgnoreDescription, toggle.ForceFailurePolicyIgnore.Parse)
@@ -399,6 +376,7 @@ func main() {
 	flagset.StringVar(&caSecretName, "caSecretName", "", "Name of the secret containing CA.")
 	flagset.StringVar(&tlsSecretName, "tlsSecretName", "", "Name of the secret containing TLS pair.")
 	flagset.Int64Var(&maxAPICallResponseLength, "maxAPICallResponseLength", 10*1000*1000, "Configure the value of maximum allowed GET response size from API Calls")
+	flagset.DurationVar(&apiCallTimeout, "apiCallTimeout", 30*time.Second, "Timeout for HTTP API calls made by policies. A value of 0 means no timeout.")
 	flagset.DurationVar(&renewBefore, "renewBefore", 15*24*time.Hour, "The certificate renewal time before expiration")
 	flagset.IntVar(&maxAuditWorkers, "maxAuditWorkers", 8, "Maximum number of workers for audit policy processing")
 	flagset.IntVar(&maxAuditCapacity, "maxAuditCapacity", 1000, "Maximum capacity of the audit policy task queue")
@@ -516,6 +494,7 @@ func main() {
 				gcstore,
 				eventGenerator,
 				maxAPICallResponseLength,
+				apiCallTimeout,
 				true,
 				setup.Jp,
 			),
@@ -564,7 +543,7 @@ func main() {
 			setup.KubeClient,
 			setup.KyvernoClient,
 			setup.RegistrySecretLister,
-			apicall.NewAPICallConfiguration(maxAPICallResponseLength),
+			apicall.NewAPICallConfiguration(maxAPICallResponseLength, apiCallTimeout),
 			polexCache,
 			gcstore,
 		)
@@ -606,7 +585,6 @@ func main() {
 					reportsServiceAccountName,
 					webhookTimeout,
 					autoUpdateWebhooks,
-					autoDeleteWebhooks,
 					kubeInformer,
 					kubeKyvernoInformer,
 					kyvernoInformer,
@@ -704,26 +682,27 @@ func main() {
 				setup.Logger.Error(err, "failed to construct manager")
 				os.Exit(1)
 			}
+			celExceptionLister := celengine.NewPolicyExceptionLister(kyvernoInformer.Policies().V1beta1().PolicyExceptions().Lister(), internal.ExceptionNamespace())
 			// create compiler
 			compiler := vpolcompiler.NewCompiler()
 			// create vpolProvider
 			vpolProvider, err := vpolengine.NewKubeProvider(
 				compiler,
 				mgr,
-				kyvernoInformer.Policies().V1beta1().PolicyExceptions().Lister(),
+				celExceptionLister,
 				internal.PolicyExceptionEnabled(),
 			)
 			if err != nil {
 				setup.Logger.Error(err, "failed to create vpol provider")
 				os.Exit(1)
 			}
-			ivpolProvider, err := ivpolengine.NewKubeProvider(mgr, kyvernoInformer.Policies().V1beta1().PolicyExceptions().Lister(), internal.PolicyExceptionEnabled())
+			ivpolProvider, err := ivpolengine.NewKubeProvider(mgr, celExceptionLister, internal.PolicyExceptionEnabled())
 			if err != nil {
 				setup.Logger.Error(err, "failed to create ivpol provider")
 				os.Exit(1)
 			}
 			mpolcompiler := mpolcompiler.NewCompiler()
-			mpolProvider, typeConverter, err := mpolengine.NewKubeProvider(signalCtx, mpolcompiler, mgr, setup.KubeClient.Discovery().OpenAPIV3(), kyvernoInformer.Policies().V1beta1().PolicyExceptions().Lister(), internal.PolicyExceptionEnabled())
+			mpolProvider, typeConverter, err := mpolengine.NewKubeProvider(signalCtx, mpolcompiler, mgr, setup.KubeClient.Discovery().OpenAPIV3(), celExceptionLister, internal.PolicyExceptionEnabled())
 			if err != nil {
 				setup.Logger.Error(err, "failed to create mpol provider")
 				os.Exit(1)

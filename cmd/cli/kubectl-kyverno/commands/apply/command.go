@@ -20,6 +20,7 @@ import (
 	kyvernov2 "github.com/kyverno/kyverno/api/kyverno/v2"
 	"github.com/kyverno/kyverno/cmd/cli/kubectl-kyverno/command"
 	"github.com/kyverno/kyverno/cmd/cli/kubectl-kyverno/commands/test"
+	"github.com/kyverno/kyverno/cmd/cli/kubectl-kyverno/data"
 	"github.com/kyverno/kyverno/cmd/cli/kubectl-kyverno/deprecations"
 	"github.com/kyverno/kyverno/cmd/cli/kubectl-kyverno/exception"
 	"github.com/kyverno/kyverno/cmd/cli/kubectl-kyverno/log"
@@ -42,10 +43,10 @@ import (
 	"github.com/kyverno/kyverno/pkg/config"
 	engineapi "github.com/kyverno/kyverno/pkg/engine/api"
 	eval "github.com/kyverno/kyverno/pkg/imageverification/evaluator"
-	"github.com/kyverno/kyverno/pkg/imageverification/imagedataloader"
 	gitutils "github.com/kyverno/kyverno/pkg/utils/git"
 	utils "github.com/kyverno/kyverno/pkg/utils/restmapper"
 	policyvalidation "github.com/kyverno/kyverno/pkg/validation/policy"
+	"github.com/kyverno/sdk/extensions/imagedataloader"
 	"github.com/spf13/cobra"
 	admissionv1 "k8s.io/api/admission/v1"
 	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
@@ -67,40 +68,43 @@ type SkippedInvalidPolicies struct {
 }
 
 type ApplyCommandConfig struct {
-	KubeConfig            string
-	Context               string
-	Namespace             string
-	MutateLogPath         string
-	Variables             []string
-	ValuesFile            string
-	UserInfoPath          string
-	ContextPath           string
-	Cluster               bool
-	PolicyReport          bool
-	OutputFormat          string
-	Stdin                 bool
-	RegistryAccess        bool
-	AuditWarn             bool
-	ResourcePaths         []string
-	PolicyPaths           []string
-	TargetResourcePaths   []string
-	ParamResources        []string
-	GitBranch             string
-	GitUsername           string
-	GitPassword           string
-	warnExitCode          int
-	warnNoPassed          bool
-	Exception             []string
-	ContinueOnFail        bool
-	inlineExceptions      bool
-	GenerateExceptions    bool
-	GeneratedExceptionTTL time.Duration
-	JSONPaths             []string
-	ClusterWideResources  bool
-	Concurrent            int
-	BatchSize             int
-	ContinueOnError       bool
-	ShowPerformance       bool
+	KubeConfig                string
+	Context                   string
+	Namespace                 string
+	MutateLogPath             string
+	Variables                 []string
+	ValuesFile                string
+	UserInfoPath              string
+	ContextPath               string
+	Cluster                   bool
+	PolicyReport              bool
+	OutputFormat              string
+	Stdin                     bool
+	RegistryAccess            bool
+	AuditWarn                 bool
+	ResourcePaths             []string
+	PolicyPaths               []string
+	TargetResourcePaths       []string
+	ParamResources            []string
+	GitBranch                 string
+	GitUsername               string
+	GitPassword               string
+	warnExitCode              int
+	warnNoPassed              bool
+	Exception                 []string
+	ContinueOnFail            bool
+	inlineExceptions          bool
+	exceptionsWithinResources bool
+	exceptionsWithinPolicies  bool
+	GenerateExceptions        bool
+	GeneratedExceptionTTL     time.Duration
+	JSONPaths                 []string
+	ClusterWideResources      bool
+	Concurrent                int
+	BatchSize                 int
+	ContinueOnError           bool
+	ShowPerformance           bool
+	CrdPath                   string
 	// Cloner is an optional function for cloning git repositories.
 	// If nil, defaults to gitutils.Clone. Tests can inject a fake
 	// to avoid real network calls while still exercising the git-URL
@@ -221,13 +225,17 @@ func Command() *cobra.Command {
 	cmd.Flags().StringSliceVarP(&applyCommandConfig.Exception, "exceptions", "", nil, "Policy exception to be considered when evaluating policies against resources")
 	cmd.Flags().BoolVar(&applyCommandConfig.ContinueOnFail, "continue-on-fail", false, "If set to true, will continue to apply policies on the next resource upon failure to apply to the current resource instead of exiting out")
 	cmd.Flags().BoolVarP(&applyCommandConfig.inlineExceptions, "exceptions-with-resources", "", false, "Evaluate policy exceptions from the resources path")
+	cmd.Flags().BoolVarP(&applyCommandConfig.exceptionsWithinResources, "exceptions-within-resources", "", false, "Evaluate policy exceptions from the resources path")
+	cmd.Flags().BoolVarP(&applyCommandConfig.exceptionsWithinPolicies, "exceptions-within-policies", "", false, "Evaluate policy exceptions from the policies path")
 	cmd.Flags().BoolVarP(&applyCommandConfig.GenerateExceptions, "generate-exceptions", "", false, "Generate policy exceptions for each violation")
 	cmd.Flags().DurationVarP(&applyCommandConfig.GeneratedExceptionTTL, "generated-exception-ttl", "", time.Hour*24*30, "Default TTL for generated exceptions")
 	cmd.Flags().BoolVarP(&applyCommandConfig.ClusterWideResources, "cluster-wide-resources", "", false, "If set to true, will apply policies to cluster-wide resources")
+
 	cmd.Flags().IntVar(&applyCommandConfig.Concurrent, "concurrent", 1, "Number of concurrent workers for resource loading")
 	cmd.Flags().IntVar(&applyCommandConfig.BatchSize, "batch-size", 100, "Number of resources to fetch per API call")
 	cmd.Flags().BoolVar(&applyCommandConfig.ContinueOnError, "continue-on-error", true, "Continue processing despite resource loading errors")
 	cmd.Flags().BoolVar(&applyCommandConfig.ShowPerformance, "show-performance", false, "Show resource loading performance metrics")
+	cmd.Flags().StringVar(&applyCommandConfig.CrdPath, "crd-path", "", "crd path to be used for apply command")
 	return cmd
 }
 
@@ -244,6 +252,8 @@ func (c *ApplyCommandConfig) applyCommandHelper(out io.Writer) (*processor.Resul
 	if err := c.cleanPreviousContent(mutateLogPathIsDir); err != nil {
 		return nil, nil, skippedInvalidPolicies, nil, err
 	}
+	processor := data.NewCRDProcessor(nil)
+	data.InjectProcessor(processor)
 	var userInfo *kyvernov2.RequestInfo
 	if c.UserInfoPath != "" {
 		info, err := userinfo.Load(nil, c.UserInfoPath, "")
@@ -259,7 +269,7 @@ func (c *ApplyCommandConfig) applyCommandHelper(out io.Writer) (*processor.Resul
 	}
 	var store store.Store
 
-	kpols, vaps, vapBindings, maps, mapBindings, vps, ivps, gps, dps, mps, err := c.loadPolicies()
+	kpols, polexs, celpolexs, vaps, vapBindings, maps, mapBindings, vps, ivps, gps, dps, mps, err := c.loadPolicies()
 	if err != nil {
 		return nil, nil, skippedInvalidPolicies, nil, err
 	}
@@ -314,7 +324,7 @@ func (c *ApplyCommandConfig) applyCommandHelper(out io.Writer) (*processor.Resul
 	}
 	var exceptions []*kyvernov2.PolicyException
 	var celexceptions []*policiesv1beta1.PolicyException
-	if c.inlineExceptions {
+	if c.exceptionsWithinResources || c.inlineExceptions {
 		exceptions = exception.SelectFrom(resources)
 	} else {
 		results, err := exception.Load(c.Exception...)
@@ -326,6 +336,12 @@ func (c *ApplyCommandConfig) applyCommandHelper(out io.Writer) (*processor.Resul
 			celexceptions = results.CELExceptions
 		}
 	}
+
+	if c.exceptionsWithinPolicies {
+		exceptions = append(exceptions, polexs...)
+		celexceptions = append(celexceptions, celpolexs...)
+	}
+
 	if !c.Stdin && !c.PolicyReport && !c.GenerateExceptions {
 		var policyRulesCount int
 		for _, policy := range kpols {
@@ -484,6 +500,7 @@ func (c *ApplyCommandConfig) applyPolicies(
 			AuditWarn:                         c.AuditWarn,
 			Subresources:                      vars.Subresources(),
 			Out:                               out,
+			CrdPath:                           c.CrdPath,
 			NamespaceCache:                    namespaceCache,
 		}
 		ers, err := processor.ApplyPoliciesOnResource()
@@ -524,6 +541,7 @@ func (c *ApplyCommandConfig) applyPolicies(
 			AuditWarn:                         c.AuditWarn,
 			Subresources:                      vars.Subresources(),
 			Out:                               out,
+			CrdPath:                           c.CrdPath,
 			NamespaceCache:                    namespaceCache,
 		}
 		ers, err := processor.ApplyPoliciesOnResource()
@@ -577,7 +595,6 @@ func (c *ApplyCommandConfig) applyImageValidatingPolicies(
 	if err != nil {
 		return nil, err
 	}
-
 	contextProvider, err := processor.NewContextProvider(dclient, restMapper, nil, c.ContextPath, c.RegistryAccess, !c.Cluster)
 	if err != nil {
 		return nil, err
@@ -782,6 +799,8 @@ func (c *ApplyCommandConfig) loadResources(out io.Writer, paths []string, polici
 
 func (c *ApplyCommandConfig) loadPolicies() (
 	[]kyvernov1.PolicyInterface,
+	[]*kyvernov2.PolicyException,
+	[]*policiesv1beta1.PolicyException,
 	[]admissionregistrationv1.ValidatingAdmissionPolicy,
 	[]admissionregistrationv1.ValidatingAdmissionPolicyBinding,
 	[]admissionregistrationv1beta1.MutatingAdmissionPolicy,
@@ -795,6 +814,8 @@ func (c *ApplyCommandConfig) loadPolicies() (
 ) {
 	// load policies
 	var policies []kyvernov1.PolicyInterface
+	var exceptions []*kyvernov2.PolicyException
+	var celExceptions []*policiesv1beta1.PolicyException
 	var vaps []admissionregistrationv1.ValidatingAdmissionPolicy
 	var vapBindings []admissionregistrationv1.ValidatingAdmissionPolicyBinding
 	var vps []policiesv1beta1.ValidatingPolicyLike
@@ -809,12 +830,12 @@ func (c *ApplyCommandConfig) loadPolicies() (
 		if isGit {
 			gitSourceURL, err := url.Parse(path)
 			if err != nil {
-				return nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, fmt.Errorf("failed to load policies (%w)", err)
+				return nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, fmt.Errorf("failed to load policies (%w)", err)
 			}
 			pathElems := strings.Split(gitSourceURL.Path[1:], "/")
 			if len(pathElems) <= 1 {
 				err := fmt.Errorf("invalid URL path %s - expected https://<any_git_source_domain>/:owner/:repository/:branch (without --git-branch flag) OR https://<any_git_source_domain>/:owner/:repository/:directory (with --git-branch flag)", gitSourceURL.Path)
-				return nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, fmt.Errorf("failed to parse URL (%w)", err)
+				return nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, fmt.Errorf("failed to parse URL (%w)", err)
 			}
 			gitSourceURL.Path = strings.Join([]string{pathElems[0], pathElems[1]}, "/")
 			repoURL := gitSourceURL.String()
@@ -827,11 +848,11 @@ func (c *ApplyCommandConfig) loadPolicies() (
 			}
 			if _, err := c.cloneRepo(repoURL, fs, c.GitBranch, *auth); err != nil {
 				log.Log.V(3).Info(fmt.Sprintf("failed to clone repository  %v as it is not valid", repoURL), "error", err)
-				return nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, fmt.Errorf("failed to clone repository (%w)", err)
+				return nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, fmt.Errorf("failed to clone repository (%w)", err)
 			}
 			policyYamls, err := gitutils.ListYamls(fs, gitPathToYamls)
 			if err != nil {
-				return nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, fmt.Errorf("failed to list YAMLs in repository (%w)", err)
+				return nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, fmt.Errorf("failed to list YAMLs in repository (%w)", err)
 			}
 			for _, policyYaml := range policyYamls {
 				loaderResults, err := policy.Load(fs, "", policyYaml)
@@ -850,6 +871,9 @@ func (c *ApplyCommandConfig) loadPolicies() (
 				maps = append(maps, loaderResults.MAPs...)
 				mapBindings = append(mapBindings, loaderResults.MAPBindings...)
 				ivps = append(ivps, loaderResults.ImageValidatingPolicies...)
+				exceptions = append(exceptions, loaderResults.PolicyExceptions...)
+				celExceptions = append(celExceptions, loaderResults.PolicyCelExceptions...)
+				gps = append(gps, loaderResults.GeneratingPolicies...)
 				dps = append(dps, loaderResults.DeletingPolicies...)
 				mps = append(mps, loaderResults.MutatingPolicies...)
 			}
@@ -870,6 +894,8 @@ func (c *ApplyCommandConfig) loadPolicies() (
 				maps = append(maps, loaderResults.MAPs...)
 				mapBindings = append(mapBindings, loaderResults.MAPBindings...)
 				ivps = append(ivps, loaderResults.ImageValidatingPolicies...)
+				exceptions = append(exceptions, loaderResults.PolicyExceptions...)
+				celExceptions = append(celExceptions, loaderResults.PolicyCelExceptions...)
 				gps = append(gps, loaderResults.GeneratingPolicies...)
 				dps = append(dps, loaderResults.DeletingPolicies...)
 				mps = append(mps, loaderResults.MutatingPolicies...)
@@ -881,7 +907,7 @@ func (c *ApplyCommandConfig) loadPolicies() (
 			}
 		}
 	}
-	return policies, vaps, vapBindings, maps, mapBindings, vps, ivps, gps, dps, mps, nil
+	return policies, exceptions, celExceptions, vaps, vapBindings, maps, mapBindings, vps, ivps, gps, dps, mps, nil
 }
 
 func (c *ApplyCommandConfig) initStoreAndClusterClient(store *store.Store, targetResources ...*unstructured.Unstructured) (dclient.Interface, error) {
@@ -920,10 +946,10 @@ func (c *ApplyCommandConfig) initStoreAndClusterClient(store *store.Store, targe
 			targets = append(targets, t)
 		}
 		dClient, err = dclient.NewFakeClient(runtime.NewScheme(), map[schema.GroupVersionResource]string{}, targets...)
-		dClient.SetDiscovery(dclient.NewFakeDiscoveryClient(nil))
 		if err != nil {
 			return nil, err
 		}
+		dClient.SetDiscovery(dclient.NewFakeDiscoveryClient(nil))
 	}
 	return dClient, err
 }
@@ -959,6 +985,9 @@ func (c *ApplyCommandConfig) checkArguments() error {
 	if len(c.ResourcePaths) == 0 && len(c.JSONPaths) == 0 && !c.Cluster {
 		return fmt.Errorf("resource file(s) or cluster required")
 	}
+	if strings.TrimSpace(c.CrdPath) != "" && strings.TrimSpace(c.KubeConfig) != "" {
+		return fmt.Errorf("crdpath and kubeconfig flags are mutually exclusive, please use only one of them")
+	}
 	return nil
 }
 
@@ -976,12 +1005,12 @@ func exit(out io.Writer, rc *processor.ResultCounts, warnExitCode int, warnNoPas
 	} else if rc.Error > 0 {
 		return fmt.Errorf("exit as there are policy errors")
 	} else if rc.Warn > 0 && warnExitCode != 0 {
-		fmt.Printf("exit as warnExitCode is %d", warnExitCode)
+		fmt.Fprintf(out, "exit as warnExitCode is %d", warnExitCode)
 		return WarnExitCodeError{
 			ExitCode: warnExitCode,
 		}
 	} else if rc.Pass == 0 && warnNoPassed {
-		fmt.Println(out, "exit as no objects satisfied policy")
+		fmt.Fprintln(out, "exit as no objects satisfied policy")
 		return WarnExitCodeError{
 			ExitCode: warnExitCode,
 		}

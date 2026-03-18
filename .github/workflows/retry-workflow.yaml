@@ -7,8 +7,7 @@ permissions: {}
 on:
   workflow_run:
     workflows:
-      - Build devcontainer
-      - Conformance tests
+      - Build test artifacts (pull request)
     types: 
       - completed
 
